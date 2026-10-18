@@ -44,7 +44,7 @@ inline bool fpb_metal_encode(const FPBMetal& m, id<MTLDevice> device, id<MTLComm
         [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
     };
 
-    [enc setBuffer:src offset:0 atIndex:0];
+    [enc setBuffer:(src ?: a) offset:0 atIndex:0];   // src nil = empty input layer
     [enc setBuffer:a offset:0 atIndex:1];
     [enc setBytes:&p length:sizeof p atIndex:2];
     grid2D(m.load, p.width, p.height);

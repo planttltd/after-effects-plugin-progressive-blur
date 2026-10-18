@@ -13,6 +13,7 @@
 #include "Param_Utils.h"
 #include "FPB_Metal.h"
 #include <new>
+#include <utility>
 
 #define MAJOR_VERSION 1
 #define MINOR_VERSION 0
@@ -24,19 +25,20 @@
 // (Transformer, Shifter) and AE_EffectCB.h macros pass PF_MF_Alpha_STRAIGHT.
 enum { FPB_INPUT_IS_STRAIGHT = 1 };
 
-enum { FPB_INPUT = 0, FPB_P1, FPB_R1, FPB_P2, FPB_R2, FPB_NUM_PARAMS };
-enum { P1_DISK_ID = 1, R1_DISK_ID, P2_DISK_ID, R2_DISK_ID };
+enum { FPB_INPUT = 0, FPB_P1, FPB_R1, FPB_P2, FPB_R2, FPB_CURVE, FPB_FLIP_POS, FPB_FLIP_AMT, FPB_NUM_PARAMS };
+enum { P1_DISK_ID = 1, R1_DISK_ID, P2_DISK_ID, R2_DISK_ID, CURVE_DISK_ID, FLIP_POS_DISK_ID, FLIP_AMT_DISK_ID };
 
-struct FPBRenderData {           // computed in PreRender, consumed in SmartRender
-    FPBParams p;                 // geometry filled here; buffer sizes filled at render
-    PF_LRect inRect, outRect;    // layer coords
+struct FPBRenderData {                 // computed in PreRender, consumed in SmartRender
+    FPBParams p;                       // geometry filled here; buffer sizes filled at render
+    PF_LRect inRect, outRect, workRect; // layer coords; work = out + blur padding
 };
 
 // ---------------------------------------------------------------- setup
 
 static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data) {
     out_data->my_version = PF_VERSION(MAJOR_VERSION, MINOR_VERSION, BUG_VERSION, STAGE_VERSION, BUILD_VERSION);
-    out_data->out_flags  = PF_OutFlag_DEEP_COLOR_AWARE;                       // 0x02000000
+    out_data->out_flags  = PF_OutFlag_DEEP_COLOR_AWARE                        // 0x02000200
+                         | PF_OutFlag_I_EXPAND_BUFFER;                        // blur spills past layer bounds
     out_data->out_flags2 = PF_OutFlag2_FLOAT_COLOR_AWARE                      // 0x0A001400
                          | PF_OutFlag2_SUPPORTS_SMART_RENDER
                          | PF_OutFlag2_SUPPORTS_GPU_RENDER_F32
@@ -55,8 +57,23 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data) {
     PF_ADD_POINT("Point 2", 50, 100, false, P2_DISK_ID);
     PF_ADD_FLOAT_SLIDERX("Point 2 Blur Radius", 0, 250, 0, 250, 40,
                          PF_Precision_TENTHS, PF_ValueDisplayFlag_NONE, 0, R2_DISK_ID);
+    AEFX_CLR_STRUCT(def);
+    PF_ADD_POPUP("Curve", 5, 1, "Linear|Ease In|Ease Out|Ease In Out|Exponential", CURVE_DISK_ID);
+    PF_ADD_BUTTON("Flip Positions", "Flip", 0, PF_ParamFlag_SUPERVISE, FLIP_POS_DISK_ID);
+    PF_ADD_BUTTON("Flip Amounts", "Flip", 0, PF_ParamFlag_SUPERVISE, FLIP_AMT_DISK_ID);
     out_data->num_params = FPB_NUM_PARAMS;
     return err;
+}
+
+// Flip buttons swap the current values (on animated params AE keys the current time).
+static PF_Err UserChangedParam(PF_ParamDef* params[], const PF_UserChangedParamExtra* extra) {
+    auto swap = [&](int a, int b) {
+        std::swap(params[a]->u, params[b]->u);
+        params[a]->uu.change_flags = params[b]->uu.change_flags = PF_ChangeFlag_CHANGED_VALUE;
+    };
+    if (extra->param_index == FPB_FLIP_POS) swap(FPB_P1, FPB_P2);
+    if (extra->param_index == FPB_FLIP_AMT) swap(FPB_R1, FPB_R2);
+    return PF_Err_NONE;
 }
 
 static PF_Err GPUDeviceSetup(PF_InData* in_data, PF_OutData* out_data, PF_GPUDeviceSetupExtra* extra) {
@@ -96,14 +113,15 @@ static PF_LRect Intersect(PF_LRect a, const PF_LRect& b) {
 
 static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderExtra* extra) {
     PF_Err err = PF_Err_NONE, err2 = PF_Err_NONE;
-    PF_ParamDef p1, r1, p2, r2;
-    AEFX_CLR_STRUCT(p1); AEFX_CLR_STRUCT(r1); AEFX_CLR_STRUCT(p2); AEFX_CLR_STRUCT(r2);
+    PF_ParamDef p1, r1, p2, r2, curve;
+    AEFX_CLR_STRUCT(p1); AEFX_CLR_STRUCT(r1); AEFX_CLR_STRUCT(p2); AEFX_CLR_STRUCT(r2); AEFX_CLR_STRUCT(curve);
     const A_long t = in_data->current_time, ts = in_data->time_step;
     const A_u_long sc = in_data->time_scale;
     ERR(PF_CHECKOUT_PARAM(in_data, FPB_P1, t, ts, sc, &p1));
     ERR(PF_CHECKOUT_PARAM(in_data, FPB_R1, t, ts, sc, &r1));
     ERR(PF_CHECKOUT_PARAM(in_data, FPB_P2, t, ts, sc, &p2));
     ERR(PF_CHECKOUT_PARAM(in_data, FPB_R2, t, ts, sc, &r2));
+    ERR(PF_CHECKOUT_PARAM(in_data, FPB_CURVE, t, ts, sc, &curve));
 
     auto* d = err ? nullptr : new (std::nothrow) FPBRenderData{};
     if (!err && !d) err = PF_Err_OUT_OF_MEMORY;
@@ -122,23 +140,27 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
         p.p2x = FIX_2_FLOAT(p2.u.td.x_value); p.p2y = FIX_2_FLOAT(p2.u.td.y_value);
         p.r1 = (float)r1.u.fs_d.value * ds;
         p.r2 = (float)r2.u.fs_d.value * ds;
+        p.curve = curve.u.pd.value - 1;   // popup is 1-based
 
         // Pad the input request by the support of FPB_ITERATIONS boxes at max radius.
         const float sigma = 0.5f * MAX(p.r1, p.r2);
-        const A_long pad = (A_long)ceilf(FPB_ITERATIONS * (sqrtf(sigma * sigma + 0.25f) + 1.5f));
+        const A_long pad = sigma > 0 ? (A_long)ceilf(FPB_ITERATIONS * (sqrtf(sigma * sigma + 0.25f) + 1.5f)) : 0;
+        auto inflate = [pad](PF_LRect r) { r.left -= pad; r.top -= pad; r.right += pad; r.bottom += pad; return r; };
 
         PF_RenderRequest req = extra->input->output_request;
-        req.rect.left -= pad; req.rect.top -= pad; req.rect.right += pad; req.rect.bottom += pad;
+        req.rect = inflate(req.rect);
         req.preserve_rgb_of_zero_alpha = FALSE;
 
         PF_CheckoutResult in_result;
         ERR(extra->cb->checkout_layer(in_data->effect_ref, FPB_INPUT, FPB_INPUT, &req, t, ts, sc, &in_result));
         if (!err) {
-            d->inRect  = in_result.result_rect;
-            d->outRect = Intersect(Intersect(extra->input->output_request.rect, in_result.max_result_rect),
-                                   in_result.result_rect);
+            // Output may extend `pad` beyond the layer, like AE's own blurs.
+            const PF_LRect maxRect = inflate(in_result.max_result_rect);
+            d->inRect   = in_result.result_rect;
+            d->outRect  = Intersect(extra->input->output_request.rect, maxRect);
+            d->workRect = inflate(d->outRect);
             extra->output->result_rect     = d->outRect;
-            extra->output->max_result_rect = in_result.max_result_rect;
+            extra->output->max_result_rect = maxRect;
             if (extra->input->what_gpu == PF_GPU_Framework_METAL)
                 extra->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
         }
@@ -147,6 +169,7 @@ static PF_Err PreRender(PF_InData* in_data, PF_OutData* out_data, PF_PreRenderEx
     ERR2(PF_CHECKIN_PARAM(in_data, &r1));
     ERR2(PF_CHECKIN_PARAM(in_data, &p2));
     ERR2(PF_CHECKIN_PARAM(in_data, &r2));
+    ERR2(PF_CHECKIN_PARAM(in_data, &curve));
     return err;
 }
 
@@ -163,10 +186,15 @@ static void CPURender(const FPBParams& p, const PF_EffectWorld* in, PF_EffectWor
     simd_float4* B = buf.data();
     const float k = 1.f / Chan<Px>::max;
 
-    dispatch_apply((size_t)p.height, DISPATCH_APPLY_AUTO, ^(size_t y) {
-        const Px* row = (const Px*)((const char*)in->data + y * in->rowbytes);
-        for (int x = 0; x < p.width; x++) {
-            simd_float4 c = simd_make_float4(row[x].red, row[x].green, row[x].blue, row[x].alpha) * k;
+    // Buffer starts transparent; copy the layer in at its offset.
+    dispatch_apply((size_t)p.inH, DISPATCH_APPLY_AUTO, ^(size_t sy) {
+        const int y = (int)sy + p.inOffY;
+        if (y < 0 || y >= p.height) return;
+        const Px* row = (const Px*)((const char*)in->data + sy * in->rowbytes);
+        for (int sx = 0; sx < p.inW; sx++) {
+            const int x = sx + p.inOffX;
+            if (x < 0 || x >= p.width) continue;
+            simd_float4 c = simd_make_float4(row[sx].red, row[sx].green, row[sx].blue, row[sx].alpha) * k;
             if (p.premultiply) c.xyz *= c.w;
             B[y * p.width + x] = c;
         }
@@ -195,20 +223,22 @@ static PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRend
     PF_EffectWorld *in = nullptr, *out = nullptr;
     ERR(extra->cb->checkout_layer_pixels(in_data->effect_ref, FPB_INPUT, &in));
     ERR(extra->cb->checkout_output(in_data->effect_ref, &out));
-    if (!err && d && in && out) {
+    if (!err && d && out) {   // `in` may be null when the input layer is empty
+        const PF_LRect& w = d->workRect;
         FPBParams p = d->p;
-        p.width = in->width; p.height = in->height;
-        p.originX = (float)d->inRect.left; p.originY = (float)d->inRect.top;
-        p.outOffX = d->outRect.left - d->inRect.left;
-        p.outOffY = d->outRect.top  - d->inRect.top;
+        p.width  = w.right - w.left; p.height = w.bottom - w.top;
+        p.originX = (float)w.left;   p.originY = (float)w.top;
+        p.inOffX = d->inRect.left - w.left; p.inOffY = d->inRect.top - w.top;
+        p.inW = in ? in->width : 0;         p.inH = in ? in->height : 0;
+        p.outOffX = d->outRect.left - w.left; p.outOffY = d->outRect.top - w.top;
         p.outW = MIN(out->width,  p.width  - p.outOffX);
         p.outH = MIN(out->height, p.height - p.outOffY);
 
         AEFX_SuiteScoper<PF_WorldSuite2> worlds(in_data, kPFWorldSuite, kPFWorldSuiteVersion2, out_data);
         PF_PixelFormat fmt = PF_PixelFormat_INVALID;
-        ERR(worlds->PF_GetPixelFormat(in, &fmt));
+        ERR(worlds->PF_GetPixelFormat(out, &fmt));
 
-        if (!err && p.outW > 0 && p.outH > 0 && p.outOffX >= 0 && p.outOffY >= 0) {
+        if (!err && p.outW > 0 && p.outH > 0) {
             if (gpu && fmt != PF_PixelFormat_GPU_BGRA128) {
                 err = PF_Err_UNRECOGNIZED_PARAM_TYPE;
             } else if (gpu) {
@@ -217,10 +247,10 @@ static PF_Err SmartRender(PF_InData* in_data, PF_OutData* out_data, PF_SmartRend
                     PF_GPUDeviceInfo info; AEFX_CLR_STRUCT(info);
                     void *src = nullptr, *dst = nullptr;
                     ERR(gs->GetDeviceInfo(in_data->effect_ref, extra->input->device_index, &info));
-                    ERR(gs->GetGPUWorldData(in_data->effect_ref, in, &src));
+                    if (in) ERR(gs->GetGPUWorldData(in_data->effect_ref, in, &src));
                     ERR(gs->GetGPUWorldData(in_data->effect_ref, out, &dst));
                     if (!err) {
-                        p.srcPitch = in->rowbytes / 16; p.dstPitch = out->rowbytes / 16;  // BGRA128
+                        p.srcPitch = in ? in->rowbytes / 16 : 0; p.dstPitch = out->rowbytes / 16;  // BGRA128
                         auto* m = static_cast<const FPBMetal*>(extra->input->gpu_data);
                         id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)info.command_queuePV;
                         id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -269,6 +299,7 @@ extern "C" DllExport PF_Err EffectMain(PF_Cmd cmd, PF_InData* in_data, PF_OutDat
             case PF_Cmd_PARAMS_SETUP:       return ParamsSetup(in_data, out_data);
             case PF_Cmd_GPU_DEVICE_SETUP:   return GPUDeviceSetup(in_data, out_data, (PF_GPUDeviceSetupExtra*)extra);
             case PF_Cmd_GPU_DEVICE_SETDOWN: return GPUDeviceSetdown((PF_GPUDeviceSetdownExtra*)extra);
+            case PF_Cmd_USER_CHANGED_PARAM: return UserChangedParam(params, (const PF_UserChangedParamExtra*)extra);
             case PF_Cmd_SMART_PRE_RENDER:   return PreRender(in_data, out_data, (PF_PreRenderExtra*)extra);
             case PF_Cmd_SMART_RENDER:       return SmartRender(in_data, out_data, (PF_SmartRenderExtra*)extra, false);
             case PF_Cmd_SMART_RENDER_GPU:   return SmartRender(in_data, out_data, (PF_SmartRenderExtra*)extra, true);
