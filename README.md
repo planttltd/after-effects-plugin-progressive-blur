@@ -38,6 +38,8 @@ AE_SDK=~/AfterEffectsSDK/Examples ./build.sh --install
 
 ## Known limits (`ponytail:` comments in source)
 
-- `FPB_INPUT_IS_STRAIGHT = 1` assumes AE passes straight alpha. If semi-transparent edges look darker or brighter than expected, set it to 0.
+Built and verified against After Effects SDK 26.5 (macOS).
+
+
 - Non-uniform downsample or non-square pixel aspect ratio uses a single averaged radius.
 - Float prefix sums carry about 1e-4 noise at very long lines. It is invisible at 8/16 bpc and only applies where blur > 0, because radius 0 is copied exactly.

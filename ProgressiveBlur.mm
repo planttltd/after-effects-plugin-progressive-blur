@@ -20,8 +20,8 @@
 #define STAGE_VERSION PF_Stage_DEVELOP
 #define BUILD_VERSION 1   // must match AE_Effect_Version in the PiPL (524289)
 
-// ponytail: assumed AE hands effects straight (unpremultiplied) alpha; if edges of
-// semi-transparent layers look wrong, set to 0.
+// AE effect worlds are straight (unpremultiplied) alpha: the SDK's own samples
+// (Transformer, Shifter) and AE_EffectCB.h macros pass PF_MF_Alpha_STRAIGHT.
 enum { FPB_INPUT_IS_STRAIGHT = 1 };
 
 enum { FPB_INPUT = 0, FPB_P1, FPB_R1, FPB_P2, FPB_R2, FPB_NUM_PARAMS };
