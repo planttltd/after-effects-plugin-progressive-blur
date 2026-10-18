@@ -23,7 +23,7 @@ AE_SDK=~/AfterEffectsSDK/Examples ./build.sh
 AE_SDK=~/AfterEffectsSDK/Examples ./build.sh --install
 ```
 
-- `--install` copies the plugin to `/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore`. Restart AE afterwards.
+- `--install` copies the plugin into the newest `/Applications/Adobe After Effects */Plug-ins` folder (no sudo). Restart AE afterwards.
 - The effect appears under **Effect › Blur & Sharpen › Progressive Blur**.
 - GPU is used when **Project Settings › Video Rendering and Effects** is set to *Mercury GPU Acceleration (Metal)*. Otherwise AE calls the CPU path automatically.
 

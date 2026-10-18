@@ -40,7 +40,8 @@ codesign --force --sign - "$OUT"   # ad-hoc; required to load on Apple Silicon
 echo "built $OUT"
 
 if [[ "${1:-}" == "--install" ]]; then
-  DEST="/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore"
-  sudo mkdir -p "$DEST" && sudo rm -rf "$DEST/ProgressiveBlur.plugin" && sudo cp -R "$OUT" "$DEST/"
+  # newest AE install's own Plug-ins folder (user-writable, no sudo)
+  DEST="$(ls -d /Applications/Adobe\ After\ Effects\ */Plug-ins | sort | tail -1)"
+  rm -rf "$DEST/ProgressiveBlur.plugin" && cp -R "$OUT" "$DEST/"
   echo "installed to $DEST (restart After Effects)"
 fi
